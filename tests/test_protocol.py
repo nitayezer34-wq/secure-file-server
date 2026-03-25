@@ -17,6 +17,21 @@ class FakeRecvSocket:
         return chunk[:n]
 
 
+class LoopbackSocket:
+    def __init__(self):
+        self.buffer = bytearray()
+
+    def sendall(self, data):
+        self.buffer.extend(data)
+
+    def recv(self, n):
+        if not self.buffer:
+            return b""
+        chunk = bytes(self.buffer[:n])
+        del self.buffer[:n]
+        return chunk
+
+
 class ProtocolTests(unittest.TestCase):
     def test_recv_exact_collects_multiple_chunks(self):
         sock = FakeRecvSocket([b"ab", b"cd", b"ef"])
@@ -26,6 +41,15 @@ class ProtocolTests(unittest.TestCase):
         sock = FakeRecvSocket([b"ab"])
         with self.assertRaises(ConnectionError):
             protocol.recv_exact(sock, 4)
+
+    def test_send_json_and_recv_json_roundtrip(self):
+        sock = LoopbackSocket()
+        first = {"action": "list", "token": "abc"}
+        second = {"status": "ok", "files": ["a.txt", "b.txt"]}
+        protocol.send_json(sock, first)
+        protocol.send_json(sock, second)
+        self.assertEqual(protocol.recv_json(sock), first)
+        self.assertEqual(protocol.recv_json(sock), second)
 
 
 if __name__ == "__main__":

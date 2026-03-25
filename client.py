@@ -16,6 +16,7 @@ load_dotenv()
 MAX_FILE_SIZE = get_env("MAX_FILE_SIZE", 10 * 1024 * 1024, int)
 SERVER_HOST = get_env("SERVER_HOST", "127.0.0.1", str)
 SERVER_PORT = get_env("SERVER_PORT", 9000, int)
+SOCKET_TIMEOUT_SECONDS = get_env("SOCKET_TIMEOUT_SECONDS", 30, int)
 
 
 def compute_sha256(path: str) -> str:
@@ -34,7 +35,7 @@ def print_connection_help() -> None:
     """Print actionable guidance when the client cannot reach the server."""
     print(f"Could not connect to server at {SERVER_HOST}:{SERVER_PORT}.")
     print("What to do:")
-    print("1. Start the server with: python server.py")
+    print("1. Start the server with: python3 server.py")
     print("2. Make sure SERVER_HOST and SERVER_PORT match in your .env")
     print("3. If the server is already running, check that the port is not blocked or changed")
 
@@ -44,6 +45,7 @@ def main():
     token = None
 
     raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw_sock.settimeout(SOCKET_TIMEOUT_SECONDS)
     if TLS_ENABLED:
         ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         ssl_context.load_verify_locations(cafile=CA_CERT_PATH)
@@ -83,7 +85,6 @@ def main():
                     print(reply.get("message", reply))
                     if action == "login" and reply.get("status") == "ok":
                         token = reply.get("token")
-                        print(f"Token: {token}")
                     continue
                 if action == "logout":
                     send_json(sock, {"action": "logout", "token": token})
@@ -178,7 +179,7 @@ def main():
                     print(f"Downloaded and verified: {save_path}")
                     continue
                 print("Unknown command. Use: register, login, list, upload, download, logout, quit.")
-        except (ConnectionError, OSError) as exc:
+        except (ConnectionError, OSError, socket.timeout) as exc:
             print(f"Connection lost: {exc}")
             print("Restart the server if needed, then run the client again.")
             sys.exit(1)

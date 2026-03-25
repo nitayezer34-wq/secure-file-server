@@ -1,14 +1,23 @@
 # Secure File Transfer System
 
-## Overview
-This project is a secure client-server file transfer system written in Python. It demonstrates how to build a small but realistic TCP application with authentication, session management, upload/download flows, integrity checks, and optional TLS, while keeping the architecture simple enough for a student portfolio.
+Secure Python client-server file transfer over TCP with framed JSON control messages, raw file streaming, per-user isolation, integrity verification, and optional TLS.
 
-The repository includes:
-- A multithreaded TCP server
-- A command-line client
-- A custom length-prefixed protocol
-- JSON control messages plus raw file streaming
-- Optional TLS for transport encryption
+## Key Capabilities
+- Authenticated upload and download with session tokens and expiration
+- PBKDF2 password hashing, login lockout, and safe path handling
+- Custom length-prefixed protocol built for TCP stream semantics
+- SHA-256 verification for upload and download integrity
+- Multithreaded server with per-file locking and environment-based configuration
+
+## How It Works
+The CLI client sends framed JSON requests over TCP for control operations such as register, login, list, upload, and download. For file transfers, metadata is exchanged first as JSON, then the file content is streamed as raw bytes. The server authenticates the session, validates the request, and reads or writes files only inside the authenticated user’s storage directory.
+
+## Quick Start
+```bash
+cp .env.example .env
+python3 server.py
+python3 client.py
+```
 
 ## Architecture Overview
 The project keeps a straightforward module split:
@@ -158,7 +167,7 @@ Metadata response:
 This project uses the Python standard library only. No third-party packages are required.
 
 Recommended version:
-- Python 3.10 or newer
+- Python 3.9 or newer
 
 ### Configuration
 Create a local `.env` file from `.env.example` if you want to override defaults.
@@ -176,6 +185,7 @@ Important settings:
 - `LOCKOUT_WINDOW_SECONDS`
 - `LOCKOUT_DURATION_SECONDS`
 - `PASSWORD_ITERATIONS`
+- `SOCKET_TIMEOUT_SECONDS`
 - `SERVER_CERT_PATH`
 - `SERVER_KEY_PATH`
 - `CA_CERT_PATH`
@@ -183,19 +193,19 @@ Important settings:
 ### Run the Server
 
 ```bash
-python server.py
+python3 server.py
 ```
 
 ### Run the Client
 
 ```bash
-python client.py
+python3 client.py
 ```
 
 ### Run the Tests
 
 ```bash
-python -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v
 ```
 
 ## TLS Notes
