@@ -1,210 +1,172 @@
-# Secure File Server (Python, TCP)
+# Secure File Transfer System
 
-## מטרת הפרויקט
-זהו פרויקט לימודי של מערכת קבצים מבוססת `client-server` ב־Python מעל `TCP`.
-המערכת מאפשרת למשתמש:
-- להירשם
-- להתחבר
-- לראות את רשימת הקבצים האישיים שלו
-- להעלות קבצים
-- להוריד קבצים
-- להתנתק
+## Overview
+This project is a secure client-server file transfer system written in Python. It demonstrates how to build a small but realistic TCP application with authentication, session management, upload/download flows, integrity checks, and optional TLS, while keeping the architecture simple enough for a student portfolio.
 
-השרת שומר לכל משתמש תיקייה נפרדת, ולכן כל משתמש עובד רק על הקבצים שלו.
+The repository includes:
+- A multithreaded TCP server
+- A command-line client
+- A custom length-prefixed protocol
+- JSON control messages plus raw file streaming
+- Optional TLS for transport encryption
 
-## מה חשוב במערכת
-המערכת מדגימה כמה נושאים חשובים בלימודי רשתות ואבטחה:
-- עבודה עם `socket` ב־TCP
-- פרוטוקול תקשורת עצמי עם `length prefix`
-- תקשורת בין לקוח לשרת עם הודעות JSON
-- העלאה והורדה של קבצים בזרם בינארי
-- ניהול משתמשים וסיסמאות
-- ניהול sessions עם token
-- הגנה על קבצים של משתמשים שונים
-- טיפול בכמה משתמשים במקביל
-- טעינת קונפיגורציה דרך `.env`
-- לוגים ותגובות שגיאה ברורות למשתמש
+## Architecture Overview
+The project keeps a straightforward module split:
 
-## איך מריצים
-אפשר קודם ליצור קובץ `.env` לפי הדוגמה שב־`.env.example`.
+| File | Responsibility |
+| --- | --- |
+| `server.py` | Accepts TCP clients, authenticates users, manages sessions, enforces lockout rules, and handles file operations |
+| `client.py` | Interactive CLI for register, login, list, upload, download, and logout |
+| `protocol.py` | Length-prefix framing, JSON message helpers, and raw file streaming helpers |
+| `config.py` | Loads `.env` values and environment variables with type conversion |
+| `users.json` | Simple JSON user store with salt and PBKDF2 password hash |
+| `storage/` | Per-user file storage root |
 
-1. מפעילים את השרת:
-```bash
-python server.py
+The server follows a thread-per-client model. Shared state such as sessions and failed login counters is protected with locks. File writes and reads are guarded by per-path locks to reduce races on the same file.
+
+## Protocol Design
+TCP is a byte stream, not a message-based protocol. That means one `send()` call on one side does not guarantee one matching `recv()` call on the other side. To avoid ambiguous boundaries, every JSON message is sent with a 4-byte big-endian length prefix.
+
+Protocol layers:
+1. JSON metadata messages are framed with a 4-byte length prefix.
+2. File content is streamed as raw bytes only after both sides already know the exact file size from JSON metadata.
+3. Upload and download flows combine both forms: framed JSON for control, then raw bytes for file content.
+
+### Length-Prefix Framing
+Each JSON message is sent as:
+
+```text
++--------------------+----------------------+
+| 4-byte length      | JSON payload bytes   |
++--------------------+----------------------+
 ```
 
-2.מפעילים את הלקוח:
-```bash
-python client.py
+Example:
+- Client serializes `{"action": "list", "token": "..."}` to UTF-8 bytes.
+- Client sends 4 bytes containing the payload length.
+- Client sends the JSON bytes.
+- Server reads exactly 4 bytes, decodes the length, then reads exactly that many bytes.
+
+This is implemented in `protocol.py` via `send_msg()`, `recv_exact()`, `recv_msg()`, `send_json()`, and `recv_json()`.
+
+## Protocol Reference
+The following table describes the current request and response shapes used by the implementation.
+
+| Action | Client JSON | Server Response | Extra Bytes |
+| --- | --- | --- | --- |
+| `register` | `{"action":"register","username":"alice","password":"secret"}` | `{"status":"ok","message":"User registered"}` or error | None |
+| `login` | `{"action":"login","username":"alice","password":"secret"}` | `{"status":"ok","message":"Login successful","token":"..."}` or error | None |
+| `logout` | `{"action":"logout","token":"..."}` | `{"status":"ok","message":"Logged out"}` or error | None |
+| `list` | `{"action":"list","token":"..."}` | `{"status":"ok","files":[...]}` or error | None |
+| `upload` metadata | `{"action":"upload","token":"...","filename":"notes.txt","size":123,"sha256":"..."}` | `{"status":"ok","message":"READY"}` or error | If ready, client sends `size` raw file bytes |
+| `upload` completion | None | `{"status":"ok","message":"Upload complete"}` or `{"status":"error","message":"sha256 mismatch"}` | None |
+| `download` | `{"action":"download","token":"...","filename":"notes.txt"}` | `{"status":"ok","size":123,"sha256":"..."}` or error | If ok, server sends `size` raw file bytes |
+
+## Request/Response Flows
+
+### Register
+1. Client sends framed JSON with `action=register`, `username`, and `password`.
+2. Server validates the request.
+3. Server creates a random salt, derives a PBKDF2-HMAC-SHA256 password hash, stores both in `users.json`, and creates the user storage directory.
+4. Server replies with success or error JSON.
+
+Example:
+
+```json
+{"action":"register","username":"alice","password":"secret"}
 ```
 
-3.פקודות זמינות בלקוח:
-- `register`
-- `login`
-- `list`
-- `upload`
-- `download`
-- `logout`
-- `quit`
+```json
+{"status":"ok","message":"User registered"}
+```
 
-## איך המערכת עובדת
-הלקוח מתחבר לשרת דרך TCP.
-כל הודעת JSON נשלחת עם כותרת של 4 בתים שמייצגת את אורך ההודעה.
-הסיבה לכך היא ש־TCP הוא זרם בתים רציף, ולכן צריך דרך לדעת איפה הודעה מתחילה ואיפה היא נגמרת.
+### Login
+1. Client sends framed JSON with credentials.
+2. Server checks lockout state.
+3. Server verifies the PBKDF2 password hash using constant-time comparison.
+4. Server creates a random session token with expiration.
+5. Server replies with the token on success.
 
-תהליך העבודה:
-1. הלקוח שולח בקשה כמו `register`, `login`, `list`, `upload`, `download`.
-2. השרת מפענח את ההודעה ומחליט איזו פעולה לבצע.
-3. אם זו פעולה שדורשת זיהוי משתמש, השרת בודק `token`.
-4. אם זו העלאה או הורדה, אחרי הודעת ה־JSON מתבצע גם מעבר של קובץ כ־raw bytes.
+Example:
 
-## כל ההגנות שיש בפרויקט
-אלה מנגנוני ההגנה וההקשחה שמומשו בפרויקט:
+```json
+{"action":"login","username":"alice","password":"secret"}
+```
 
-### 1. שמירת סיסמאות בצורה מאובטחת
-המערכת לא שומרת סיסמה כטקסט רגיל.
-במקום זה:
-- נוצר `salt` אקראי לכל משתמש
-- מתבצע hashing עם `PBKDF2-HMAC-SHA256`
-- נשמרים רק `salt` ו־`password_hash`
+```json
+{"status":"ok","message":"Login successful","token":"4b5b..."}
+```
 
-### 2. אימות לפי session token
-אחרי login מוצלח השרת יוצר `token`.
-כל פעולה רגישה כמו `list`, `upload`, `download`, `logout` דורשת token תקין.
+### Upload
+1. Client computes the local file SHA-256.
+2. Client sends framed JSON metadata containing `filename`, `size`, `sha256`, and `token`.
+3. Server validates authentication, filename, declared size, and digest format.
+4. Server replies with `READY` if the upload may proceed.
+5. Client streams raw file bytes.
+6. Server writes to a temporary `.part` file while hashing the incoming bytes.
+7. If the calculated SHA-256 matches the declared value, the server atomically replaces the final file.
+8. Server sends a final JSON result.
 
-### 3. תפוגת session
-לכל token יש זמן תפוגה.
-אם עבר הזמן, השרת מבטל אותו ולא מאפשר להשתמש בו.
+Metadata:
 
-### 4. חסימת brute force בסיסית
-אם יש יותר מדי ניסיונות login שגויים בפרק זמן קצר:
-- השרת סופר כישלונות
-- המשתמש נכנס ל־lockout זמני
-- בזמן החסימה אי אפשר לנסות להתחבר
+```json
+{"action":"upload","token":"...","filename":"report.pdf","size":2048,"sha256":"abc123..."}
+```
 
-### 5. הפרדה בין קבצי משתמשים
-לכל משתמש יש תיקייה משלו תחת `storage/username`.
-משתמש לא יכול לבקש קובץ של משתמש אחר לפי נתיב.
+Ready response:
 
-### 6. הגנה מפני path traversal
-השרת בודק ששם הקובץ בטוח:
-- אין `..`
-- אין `/`
-- אין `\`
-- השם חייב לעמוד בתבנית תווים חוקית
+```json
+{"status":"ok","message":"READY"}
+```
 
-המטרה היא למנוע גישה לנתיבים מחוץ לתיקיית המשתמש.
+Completion response:
 
-### 7. הגבלת גודל קובץ
-יש מגבלת גודל לקבצים.
-כך נמנעת העלאה של קבצים גדולים מדי שעלולים להכביד על השרת.
+```json
+{"status":"ok","message":"Upload complete"}
+```
 
-### 8. בדיקת תקינות קובץ עם SHA-256
-בהעלאה:
-- הלקוח מחשב hash לקובץ
-- השרת מקבל את הקובץ
-- השרת מחשב hash מחדש
-- אם ה־hash לא תואם, הקובץ נדחה
+### Download
+1. Client sends framed JSON with `action=download`, `token`, and `filename`.
+2. Server validates authentication and file existence.
+3. Server computes file size and SHA-256.
+4. Server sends framed JSON metadata with `size` and `sha256`.
+5. Server streams raw file bytes.
+6. Client writes the file locally while computing its own SHA-256.
+7. Client deletes the downloaded file if the hash does not match.
 
-בהורדה:
-- השרת שולח גם את ה־hash של הקובץ
-- הלקוח בודק בסוף שהקובץ שהתקבל אכן תקין
+Metadata response:
 
-### 9. שמירה אטומית בזמן upload
-השרת קודם שומר את הקובץ ל־temp file עם סיומת `.part`.
-רק אם ההעלאה תקינה, הוא מחליף את הקובץ האמיתי.
-כך לא נשאר קובץ חצי־כתוב במקרה של ניתוק באמצע.
+```json
+{"status":"ok","size":2048,"sha256":"abc123..."}
+```
 
-### 10. תמיכה בכמה משתמשים במקביל
-השרת עובד עם thread נפרד לכל חיבור.
-בנוסף:
-- מצב משותף כמו sessions וניסיונות login מוגן עם locks
-- פעולות על אותו קובץ מוגנות עם lock לפי נתיב קובץ
+## Security Features
+- PBKDF2-HMAC-SHA256 password hashing with a unique random salt per user
+- Constant-time password comparison using `hmac.compare_digest`
+- Session tokens with expiration
+- Login lockout after repeated failed attempts within a time window
+- Optional TLS support for encrypted transport
+- Per-user storage directories
+- Safe filename validation to reduce path traversal risk
+- Maximum file size enforcement
+- SHA-256 integrity verification on upload and download
+- Temporary file writes with atomic replace on successful upload
+- Per-file locks and shared-state locks for basic thread safety
 
-כך כמה משתמשים יכולים לעבוד בו־זמנית בלי לדרוס נתונים.
+## Setup
+### Requirements
+This project uses the Python standard library only. No third-party packages are required.
 
-### 11. לוגים בצד השרת
-השרת כותב אירועים ל־`server.log`, למשל:
-- רישום
-- התחברות
-- כשלי אימות
-- העלאות
-- הורדות
+Recommended version:
+- Python 3.10 or newer
 
-### 12. הודעות שגיאה ברורות בלקוח
-במקום traceback גולמי, הלקוח מסביר למשתמש:
-- איך להפעיל את השרת
-- מה לבדוק ב־`.env`
-- מתי צריך login
-- מה לעשות אם החיבור נפל
+### Configuration
+Create a local `.env` file from `.env.example` if you want to override defaults.
 
-## אחריות של כל קובץ
-בפרויקט הזה אין "דפים" של אתר, כי זה לא אתר אלא מערכת client-server.
-במקום דפים, אלו האחריויות של כל קובץ:
-
-### `server.py`
-הקובץ המרכזי של השרת.
-אחראי על:
-- פתיחת socket והאזנה לחיבורים
-- טיפול בכל לקוח
-- register / login / logout
-- יצירת וניהול tokens
-- ניהול lockout
-- list / upload / download
-- שמירה על בידוד בין משתמשים
-- לוגים
-- עבודה מקבילית עם threads
-
-### `client.py`
-הקובץ של הלקוח.
-אחראי על:
-- התחברות לשרת
-- הצגת תפריט פקודות למשתמש
-- שליחת בקשות לשרת
-- חישוב hash לפני upload
-- אימות hash אחרי download
-- הצגת הודעות שגיאה ברורות
-
-### `protocol.py`
-קובץ עזר של פרוטוקול התקשורת.
-אחראי על:
-- שליחת הודעות עם `length prefix`
-- קבלת הודעות מלאות
-- המרה ל־JSON ומ־JSON
-- שליחה וקבלה של קבצים כ־raw bytes
-
-### `config.py`
-קובץ עזר לקונפיגורציה.
-אחראי על:
-- טעינת ערכים מתוך `.env`
-- טעינת environment variables
-- המרה של הערכים לטיפוסים כמו `int` ו־`str`
-
-### `.env.example`
-קובץ דוגמה להגדרות.
-עוזר להבין אילו משתנים אפשר להגדיר בלי לגעת בקוד.
-
-### `users.json`
-מסד נתונים פשוט בפורמט JSON.
-אחראי על:
-- שמירת משתמשים
-- שמירת salt
-- שמירת password hash
-
-### `storage/`
-תיקיית האחסון של הקבצים.
-לכל משתמש נוצרת תיקייה נפרדת.
-
-### `server.log`
-קובץ לוגים של השרת.
-שומר תיעוד של פעולות ואירועים חשובים.
-
-## קונפיגורציה
-המערכת יכולה לקרוא ערכים מתוך `.env` או מתוך environment variables.
-
-דוגמאות לערכים חשובים:
+Important settings:
 - `SERVER_HOST`
 - `SERVER_PORT`
+- `TLS_ENABLED`
 - `USERS_FILE`
 - `STORAGE_DIR`
 - `LOG_FILE`
@@ -214,35 +176,58 @@ python client.py
 - `LOCKOUT_WINDOW_SECONDS`
 - `LOCKOUT_DURATION_SECONDS`
 - `PASSWORD_ITERATIONS`
+- `SERVER_CERT_PATH`
+- `SERVER_KEY_PATH`
+- `CA_CERT_PATH`
 
-## יתרונות לימודיים של הפרויקט
-הפרויקט טוב ללמידה כי הוא משלב בין כמה תחומים:
-- תכנות רשתות
-- אבטחת מידע בסיסית
-- עבודה עם קבצים
-- תכנון פרוטוקול
-- תכנון צד שרת וצד לקוח
-- טיפול בשגיאות
-- עבודה עם concurrency
-- הפרדה בין שכבות אחריות
+### Run the Server
 
-## מגבלות ידועות
-חשוב גם לדעת מה הפרויקט עדיין לא פותר:
-- יש תמיכה אופציונלית ב־`TLS` דרך `TLS_ENABLED`
-- כאשר `TLS` מופעל, התעבורה בין הלקוח לשרת מוצפנת
-- זו הצפנה ברמת התעבורה (`transport encryption`) ולא הצפנה מקצה לקצה (`end-to-end encryption`)
-- ה־sessions נשמרים בזיכרון בלבד ונמחקים כשהשרת עולה מחדש
-- מנגנון ה־lockout נשמר בזיכרון בלבד
-- אין מסד נתונים אמיתי
-- אין הרשאות מתקדמות מעבר להפרדה לפי תיקיית משתמש
-- אין scaling לכמה שרתים או כמה תהליכים שונים
+```bash
+python server.py
+```
 
-## סיכום
-זהו פרויקט לימודי טוב שמדגים מערכת קבצים מאובטחת יחסית ברמת בסיס, מעל TCP, עם רישום משתמשים, login, sessions, העלאה והורדה של קבצים, תמיכה בכמה משתמשים במקביל, ובדיקות תקינות לקבצים.
+### Run the Client
 
-החוזקות המרכזיות שלו הן:
-- מבנה ברור
-- חלוקה טובה בין קבצים
-- אבטחה בסיסית טובה לפרויקט לימודי
-- שימוש בפרוטוקול תקשורת מסודר
-- תמיכה בריבוי משתמשים במקביל
+```bash
+python client.py
+```
+
+### Run the Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+## TLS Notes
+TLS is disabled by default. To enable it:
+1. Set `TLS_ENABLED=true` in `.env`.
+2. Provide a server certificate and private key at the configured paths.
+3. Point the client `CA_CERT_PATH` to the certificate authority or self-signed certificate you trust for testing.
+
+For a student portfolio project, self-signed certificates are acceptable for local testing, but they are not equivalent to a production PKI deployment.
+
+## Limitations
+- User data is stored in a JSON file rather than a database
+- Session state is held in memory, so it is lost when the server restarts
+- The protocol is intentionally simple and does not support resumable transfers
+- The server uses a thread-per-client model, which is fine for small-scale workloads but not optimized for high concurrency
+- There is no role model, audit backend, or advanced access control
+- TLS certificate lifecycle management is manual
+
+## Future Improvements
+- Add structured protocol versioning
+- Add automated certificate generation instructions for local development
+- Separate server logic into smaller modules as the project grows
+- Add integration tests for full client-server flows
+- Add configurable storage quotas per user
+- Add request IDs or richer logging context for troubleshooting
+
+## Why This Project Works Well as a Portfolio Piece
+This repository demonstrates practical networking and security concepts without unnecessary complexity:
+- Socket programming over TCP
+- Message framing over a byte stream
+- Authentication and session management
+- Secure password storage
+- File transfer and integrity verification
+- Thread safety and concurrent client handling
+- Basic operational configuration through environment variables
