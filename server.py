@@ -9,7 +9,7 @@ import threading
 from typing import Optional
 
 from auth import get_username_from_token, handle_login, handle_logout, hash_password
-from config import SERVER_CERT_PATH, SERVER_KEY_PATH, TLS_ENABLED, get_env, load_dotenv
+from config import TLS_ENABLED, get_env, load_dotenv, validate_server_tls_config
 from protocol import recv_json, send_json
 from storage import (
     FileLockRegistry,
@@ -224,8 +224,9 @@ def main():
     os.makedirs(STORAGE_DIR, exist_ok=True)
     ssl_context = None
     if TLS_ENABLED:
+        cert_path, key_path = validate_server_tls_config()
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_context.load_cert_chain(certfile=SERVER_CERT_PATH, keyfile=SERVER_KEY_PATH)
+        ssl_context.load_cert_chain(certfile=cert_path, keyfile=key_path)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_sock:
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -264,4 +265,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as exc:
+        raise SystemExit(f"Server startup failed: {exc}")

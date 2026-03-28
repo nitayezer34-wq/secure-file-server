@@ -56,6 +56,7 @@ def send_raw_file(sock, fileobj, size: int, chunk_size: int = 65536) -> None:
         remaining -= len(chunk)
 
 
+
 def recv_raw_file(sock, fileobj, size: int, chunk_size: int = 65536, hasher=None) -> None:
     """Receive raw file bytes and optionally update a hash while writing them."""
     remaining = size

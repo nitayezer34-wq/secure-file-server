@@ -8,7 +8,7 @@ import ssl
 import string
 import sys
 
-from config import CA_CERT_PATH, TLS_ENABLED, get_env, load_dotenv
+from config import TLS_ENABLED, get_env, load_dotenv, validate_client_tls_config
 from protocol import recv_json, recv_raw_file, send_json, send_raw_file
 
 load_dotenv()
@@ -44,14 +44,20 @@ def main():
     """Run the interactive client loop and dispatch user commands to the server."""
     token = None
 
-    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    raw_sock.settimeout(SOCKET_TIMEOUT_SECONDS)
-    if TLS_ENABLED:
-        ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ssl_context.load_verify_locations(cafile=CA_CERT_PATH)
-        sock = ssl_context.wrap_socket(raw_sock, server_hostname="localhost")
-    else:
-        sock = raw_sock
+    try:
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.settimeout(SOCKET_TIMEOUT_SECONDS)
+        if TLS_ENABLED:
+            ca_cert_path = validate_client_tls_config()
+            ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+            ssl_context.load_verify_locations(cafile=ca_cert_path)
+            sock = ssl_context.wrap_socket(raw_sock, server_hostname=SERVER_HOST)
+        else:
+            sock = raw_sock
+    except RuntimeError as exc:
+        print(f"TLS configuration error: {exc}")
+        print("Generate or configure a trusted CA/server certificate before connecting.")
+        sys.exit(1)
 
     with sock:
         try:

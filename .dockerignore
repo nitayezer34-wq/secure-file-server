@@ -1,0 +1,27 @@
+.git
+.gitignore
+.idea
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+.DS_Store
+
+# Local environment files
+.env
+
+# Runtime data and local artifacts
+storage
+users.json
+certs/*.crt
+certs/*.key
+certs/*.pem
+
+# Test and cache output
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov

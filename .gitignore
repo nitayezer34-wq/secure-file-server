@@ -1,7 +1,21 @@
 .DS_Store
 .idea/
 .venv/
+.env
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 *.log
-*.key
+
+# Runtime data
+users.json
+storage/*
+!storage/.gitkeep
+
+# Local TLS artifacts
+certs/*
+!certs/.gitkeep
+certs/*.crt
+certs/*.key
+certs/*.pem
