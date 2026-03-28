@@ -1,48 +1,127 @@
-# Secure File Transfer System
+# Secure File Server
 
-Secure Python client-server file transfer over TCP with framed JSON control messages, raw file streaming, per-user isolation, integrity verification, and optional TLS.
+A backend/systems project focused on low-level TCP protocol design, secure authentication, and concurrent file handling.
 
-## Key Capabilities
-- Authenticated upload and download with session tokens and expiration
-- PBKDF2 password hashing, login lockout, and safe path handling
-- Custom length-prefixed protocol built for TCP stream semantics
-- SHA-256 verification for upload and download integrity
-- Multithreaded server with per-file locking and environment-based configuration
-
-## How It Works
-The CLI client sends framed JSON requests over TCP for control operations such as register, login, list, upload, and download. For file transfers, metadata is exchanged first as JSON, then the file content is streamed as raw bytes. The server authenticates the session, validates the request, and reads or writes files only inside the authenticated user’s storage directory.
+Custom application-layer protocol over raw TCP using length-prefixed JSON framing.  
+Thread-per-client server with authenticated multi-user access and per-user storage isolation.  
+Optional TLS with fail-fast validation, `.env`-driven configuration, and Docker/Compose deployment.
 
 ## Quick Start
+
+### Local run
 ```bash
-cp .env.example .env
+python3 setup.py init
 python3 server.py
 python3 client.py
 ```
 
+### Docker Compose
+```bash
+python3 setup.py init
+docker compose up --build
+```
+
+### Enable TLS for local testing
+```bash
+python3 setup.py createcrt --name server --days 365
+```
+
+Then update `.env`:
+
+```env
+TLS_ENABLED=true
+SERVER_CERT_PATH=certs/server.crt
+SERVER_KEY_PATH=certs/server.key
+CA_CERT_PATH=certs/server.crt
+```
+
+## Technical Highlights
+
+### Networking
+- Custom application-layer protocol over raw TCP
+- 4-byte length-prefixed JSON framing
+- Raw file streaming after metadata exchange
+- Exact-byte reads for TCP stream correctness
+
+### Security
+- PBKDF2-HMAC-SHA256 password hashing with per-user salt
+- Constant-time password verification
+- Login lockout protection
+- TLS support with fail-fast validation
+- SHA-256 verification on upload and download
+- Per-user storage isolation
+- Filename and path validation
+- Atomic file replacement on upload
+
+### Concurrency
+- Thread-per-client server model
+- Shared session state protected by locks
+- Per-file locking for concurrent file access
+
+### Deployment
+- `.env`-driven configuration
+- Automated bootstrap with `setup.py`
+- Dockerized server workflow
+- `docker compose` support
+- Persistent runtime volumes
+- Non-root container execution
+
+## Project Structure
+```text
+.
+├── auth.py
+├── client.py
+├── config.py
+├── protocol.py
+├── server.py
+├── setup.py
+├── storage.py
+├── tests/
+├── certs/
+├── storage/
+├── users.json
+├── Dockerfile
+├── docker-compose.yml
+└── .env.example
+```
+
 ## Architecture Overview
-The project keeps a straightforward module split:
 
-| File | Responsibility |
-| --- | --- |
-| `server.py` | Accepts TCP clients, authenticates users, manages sessions, enforces lockout rules, and handles file operations |
-| `client.py` | Interactive CLI for register, login, list, upload, download, and logout |
-| `protocol.py` | Length-prefix framing, JSON message helpers, and raw file streaming helpers |
-| `config.py` | Loads `.env` values and environment variables with type conversion |
-| `users.json` | Simple JSON user store with salt and PBKDF2 password hash |
-| `storage/` | Per-user file storage root |
+### Server
+`server.py` runs a multi-user TCP server using a thread-per-client model. It accepts client connections, performs request routing, manages sessions, applies authentication checks, and delegates file operations.
 
-The server follows a thread-per-client model. Shared state such as sessions and failed login counters is protected with locks. File writes and reads are guarded by per-path locks to reduce races on the same file.
+### Client
+`client.py` is an interactive CLI client that supports register, login, list, upload, download, logout, and optional TLS.
 
-## Protocol Design
-TCP is a byte stream, not a message-based protocol. That means one `send()` call on one side does not guarantee one matching `recv()` call on the other side. To avoid ambiguous boundaries, every JSON message is sent with a 4-byte big-endian length prefix.
+### Protocol Layer
+`protocol.py` implements the wire protocol primitives:
+- 4-byte big-endian message length prefix for JSON messages
+- exact byte reads for TCP stream correctness
+- raw file streaming after metadata exchange
 
-Protocol layers:
-1. JSON metadata messages are framed with a 4-byte length prefix.
-2. File content is streamed as raw bytes only after both sides already know the exact file size from JSON metadata.
-3. Upload and download flows combine both forms: framed JSON for control, then raw bytes for file content.
+### Authentication Layer
+`auth.py` handles:
+- password hashing with `PBKDF2-HMAC-SHA256`
+- constant-time hash comparison
+- session token issuance and expiration
+- failed-login tracking and temporary lockout
 
-### Length-Prefix Framing
-Each JSON message is sent as:
+### Storage Layer
+`storage.py` handles:
+- per-user directory layout under `storage/<username>/`
+- username and filename validation
+- upload/download workflows
+- temporary file writes and atomic replacement
+- in-process per-file locking
+
+### Configuration Layer
+`config.py` loads configuration from `.env` and environment variables, and validates TLS paths when TLS is enabled.
+
+## Protocol Overview
+TCP is a byte stream, not a message-oriented transport. This project therefore implements explicit framing rather than assuming one `send()` maps to one `recv()`.
+
+### Framing strategy
+Every JSON control message is sent as:
 
 ```text
 +--------------------+----------------------+
@@ -50,177 +129,110 @@ Each JSON message is sent as:
 +--------------------+----------------------+
 ```
 
-Example:
-- Client serializes `{"action": "list", "token": "..."}` to UTF-8 bytes.
-- Client sends 4 bytes containing the payload length.
-- Client sends the JSON bytes.
-- Server reads exactly 4 bytes, decodes the length, then reads exactly that many bytes.
+This avoids boundary ambiguity and makes the protocol robust over a raw socket connection.
 
-This is implemented in `protocol.py` via `send_msg()`, `recv_exact()`, `recv_msg()`, `send_json()`, and `recv_json()`.
+### Message flow
+1. Client sends framed JSON metadata.
+2. Server validates the request and authentication state.
+3. If the operation is a file transfer, metadata is exchanged first.
+4. Raw file bytes are streamed only after both sides agree on size and transfer state.
 
-## Protocol Reference
-The following table describes the current request and response shapes used by the implementation.
-
-| Action | Client JSON | Server Response | Extra Bytes |
+### Supported actions
+| Action | Request | Response | Extra bytes |
 | --- | --- | --- | --- |
-| `register` | `{"action":"register","username":"alice","password":"secret"}` | `{"status":"ok","message":"User registered"}` or error | None |
-| `login` | `{"action":"login","username":"alice","password":"secret"}` | `{"status":"ok","message":"Login successful","token":"..."}` or error | None |
-| `logout` | `{"action":"logout","token":"..."}` | `{"status":"ok","message":"Logged out"}` or error | None |
-| `list` | `{"action":"list","token":"..."}` | `{"status":"ok","files":[...]}` or error | None |
-| `upload` metadata | `{"action":"upload","token":"...","filename":"notes.txt","size":123,"sha256":"..."}` | `{"status":"ok","message":"READY"}` or error | If ready, client sends `size` raw file bytes |
-| `upload` completion | None | `{"status":"ok","message":"Upload complete"}` or `{"status":"error","message":"sha256 mismatch"}` | None |
-| `download` | `{"action":"download","token":"...","filename":"notes.txt"}` | `{"status":"ok","size":123,"sha256":"..."}` or error | If ok, server sends `size` raw file bytes |
+| `register` | username + password | success/error JSON | None |
+| `login` | username + password | success/error JSON, optional token | None |
+| `logout` | token | success/error JSON | None |
+| `list` | token | file list JSON | None |
+| `upload` | token + filename + size + sha256 | ready/error JSON | client then sends raw file bytes |
+| `download` | token + filename | metadata/error JSON | server then sends raw file bytes |
 
-## Request/Response Flows
+## Request Flows
 
 ### Register
 1. Client sends framed JSON with `action=register`, `username`, and `password`.
-2. Server validates the request.
-3. Server creates a random salt, derives a PBKDF2-HMAC-SHA256 password hash, stores both in `users.json`, and creates the user storage directory.
-4. Server replies with success or error JSON.
-
-Example:
-
-```json
-{"action":"register","username":"alice","password":"secret"}
-```
-
-```json
-{"status":"ok","message":"User registered"}
-```
+2. Server validates the username and checks whether the user already exists.
+3. Server creates a random salt, hashes the password, stores the result in `users.json`, and creates the user storage directory.
+4. Server returns a JSON success or error response.
 
 ### Login
-1. Client sends framed JSON with credentials.
+1. Client sends framed JSON credentials.
 2. Server checks lockout state.
-3. Server verifies the PBKDF2 password hash using constant-time comparison.
-4. Server creates a random session token with expiration.
-5. Server replies with the token on success.
-
-Example:
-
-```json
-{"action":"login","username":"alice","password":"secret"}
-```
-
-```json
-{"status":"ok","message":"Login successful","token":"4b5b..."}
-```
+3. Server verifies the password using `PBKDF2-HMAC-SHA256` and constant-time comparison.
+4. Server issues a session token with expiration on success.
+5. Server returns the token in the response.
 
 ### Upload
 1. Client computes the local file SHA-256.
-2. Client sends framed JSON metadata containing `filename`, `size`, `sha256`, and `token`.
+2. Client sends metadata: filename, size, sha256, and token.
 3. Server validates authentication, filename, declared size, and digest format.
-4. Server replies with `READY` if the upload may proceed.
+4. Server replies with `READY` if the transfer may proceed.
 5. Client streams raw file bytes.
-6. Server writes to a temporary `.part` file while hashing the incoming bytes.
-7. If the calculated SHA-256 matches the declared value, the server atomically replaces the final file.
-8. Server sends a final JSON result.
-
-Metadata:
-
-```json
-{"action":"upload","token":"...","filename":"report.pdf","size":2048,"sha256":"abc123..."}
-```
-
-Ready response:
-
-```json
-{"status":"ok","message":"READY"}
-```
-
-Completion response:
-
-```json
-{"status":"ok","message":"Upload complete"}
-```
+6. Server writes to a temporary `.part` file while hashing the incoming content.
+7. Server verifies the received SHA-256 and atomically replaces the final file only on success.
 
 ### Download
-1. Client sends framed JSON with `action=download`, `token`, and `filename`.
+1. Client sends a framed JSON request with `action=download`, token, and filename.
 2. Server validates authentication and file existence.
 3. Server computes file size and SHA-256.
-4. Server sends framed JSON metadata with `size` and `sha256`.
+4. Server sends metadata containing `size` and `sha256`.
 5. Server streams raw file bytes.
-6. Client writes the file locally while computing its own SHA-256.
-7. Client deletes the downloaded file if the hash does not match.
+6. Client writes the file locally while recomputing SHA-256.
+7. Client deletes the local output if the final hash does not match.
 
-Metadata response:
+## Security
 
-```json
-{"status":"ok","size":2048,"sha256":"abc123..."}
-```
+### Authentication and Session Handling
+- passwords are hashed with `PBKDF2-HMAC-SHA256`
+- each user gets a unique random salt
+- password verification uses constant-time comparison
+- login failures are tracked and can trigger temporary lockout
+- session tokens are issued after login and expire after a configurable TTL
 
-## Security Features
-- PBKDF2-HMAC-SHA256 password hashing with a unique random salt per user
-- Constant-time password comparison using `hmac.compare_digest`
-- Session tokens with expiration
-- Login lockout after repeated failed attempts within a time window
-- Optional TLS support for encrypted transport
-- Per-user storage directories
-- Safe filename validation to reduce path traversal risk
-- Maximum file size enforcement
-- SHA-256 integrity verification on upload and download
-- Temporary file writes with atomic replace on successful upload
-- Per-file locks and shared-state locks for basic thread safety
+### File Safety
+- usernames and filenames are validated against traversal and ambiguous path input
+- each user is restricted to their own storage directory
+- uploads are written to a temporary file first
+- successful uploads use atomic replace to reduce corruption risk
+- per-file locks reduce races on concurrent access to the same file
 
-## Setup
-### Requirements
-This project uses the Python standard library only. No third-party packages are required.
+### TLS
+TLS is disabled by default but supported explicitly.
 
-Recommended version:
-- Python 3.9 or newer
+When `TLS_ENABLED=true`:
+- the server validates that both the configured certificate and private key exist before startup
+- the client validates that the configured CA/self-signed certificate exists before connecting
+- misconfiguration fails early with a readable error instead of a vague SSL failure later
 
-### Configuration
-Create a local `.env` file from `.env.example` if you want to override defaults.
+For local development, `setup.py createcrt` generates a self-signed certificate suitable for `localhost` and `127.0.0.1`.
 
-Important settings:
-- `SERVER_HOST`
-- `SERVER_PORT`
-- `TLS_ENABLED`
-- `USERS_FILE`
-- `STORAGE_DIR`
-- `LOG_FILE`
-- `MAX_FILE_SIZE`
-- `SESSION_TTL_SECONDS`
-- `LOCKOUT_THRESHOLD`
-- `LOCKOUT_WINDOW_SECONDS`
-- `LOCKOUT_DURATION_SECONDS`
-- `PASSWORD_ITERATIONS`
-- `SOCKET_TIMEOUT_SECONDS`
-- `SERVER_CERT_PATH`
-- `SERVER_KEY_PATH`
-- `CA_CERT_PATH`
+## Configuration
+Configuration is environment-driven through `.env` and standard environment variables.
 
-### Run the Server
+## Docker
 
+### Image and runtime approach
+- official `python:3.12-slim` base image
+- cache-friendly Dockerfile order
+- non-root runtime user
+- persistent bind mounts
+
+### Run with Compose
 ```bash
-python3 server.py
+python3 setup.py init
+docker compose up --build
 ```
 
-### Run the Client
-
-```bash
-python3 client.py
-```
-
-### Run the Tests
-
+## Testing
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-## TLS Notes
-TLS is disabled by default. To enable it:
-1. Set `TLS_ENABLED=true` in `.env`.
-2. Provide a server certificate and private key at the configured paths.
-3. Point the client `CA_CERT_PATH` to the certificate authority or self-signed certificate you trust for testing.
-
-For a student portfolio project, self-signed certificates are acceptable for local testing, but they are not equivalent to a production PKI deployment.
-
 ## Limitations
-- User data is stored in a JSON file rather than a database
-- Session state is held in memory, so it is lost when the server restarts
-- The protocol is intentionally simple and does not support resumable transfers
-- The server uses a thread-per-client model, which is fine for small-scale workloads but not optimized for high concurrency
-- There is no role model, audit backend, or advanced access control
-- TLS certificate lifecycle management is manual
+- no database (JSON-based storage)
+- in-memory sessions
+- thread-per-client (not high-scale)
+- manual TLS lifecycle
 
+## Portfolio Summary
+Demonstrates protocol design, concurrency, security, and containerized deployment in a clean, end-to-end backend project.
