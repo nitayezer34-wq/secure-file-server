@@ -6,10 +6,12 @@ import os
 import socket
 import ssl
 import threading
+import time
 from typing import Optional
 
 from auth import get_username_from_token, handle_login, handle_logout, hash_password
 from config import TLS_ENABLED, get_env, load_dotenv, validate_server_tls_config
+from logging_utils import log_event
 from protocol import PROTOCOL_VERSION, build_response, error_response, recv_json, send_json
 from storage import (
     FileLockRegistry,
@@ -39,28 +41,9 @@ REQUEST_SCHEMA = {
 }
 
 
-def log_event(
-    level: int,
-    event: str,
-    action: str,
-    status: str,
-    client_ip: str,
-    request_id: Optional[str] = None,
-    **fields,
-) -> None:
-    """Log one structured event with consistent key=value fields."""
-    parts = [
-        f"event={event}",
-        f"action={action}",
-        f"status={status}",
-        f"client_ip={client_ip}",
-        f"request_id={request_id or '-'}",
-    ]
-    for key, value in fields.items():
-        if value is None or value == "":
-            continue
-        parts.append(f"{key}={value}")
-    logging.log(level, " ".join(parts))
+def elapsed_ms(start_time: float) -> int:
+    """Return elapsed milliseconds from a perf_counter start time."""
+    return int((time.perf_counter() - start_time) * 1000)
 
 
 def finalize_response(response: dict, request_id: Optional[str]) -> dict:
@@ -68,12 +51,12 @@ def finalize_response(response: dict, request_id: Optional[str]) -> dict:
     if not response:
         return {}
     payload = dict(response)
-    payload.setdefault("protocol_version", PROTOCOL_VERSION)
-    if request_id is not None:
-        payload.setdefault("request_id", request_id)
-    if payload.get("status") == "error":
-        payload.setdefault("error_code", "REQUEST_FAILED")
-    return payload
+    status = payload.pop("status", "ok")
+    wrapped = build_response(status=status, request_id=request_id, **payload)
+    if status == "error":
+        wrapped.setdefault("error_code", "REQUEST_FAILED")
+        wrapped.setdefault("message", "Request failed")
+    return wrapped
 
 
 def validate_request(payload: dict) -> Optional[dict]:
@@ -84,6 +67,18 @@ def validate_request(payload: dict) -> Optional[dict]:
     request_id = payload.get("request_id")
     action = payload.get("action")
 
+    if protocol_version is None:
+        return error_response(
+            "MISSING_PROTOCOL_VERSION",
+            "protocol_version is required.",
+            request_id=request_id if isinstance(request_id, str) else None,
+        )
+    if not isinstance(protocol_version, int):
+        return error_response(
+            "INVALID_PROTOCOL_VERSION",
+            "protocol_version must be an integer.",
+            request_id=request_id if isinstance(request_id, str) else None,
+        )
     if protocol_version != PROTOCOL_VERSION:
         return error_response(
             "UNSUPPORTED_PROTOCOL_VERSION",
@@ -126,6 +121,7 @@ def load_users() -> dict:
     except json.JSONDecodeError as exc:
         log_event(
             logging.ERROR,
+            "server",
             "startup",
             "load_users",
             "failure",
@@ -177,11 +173,15 @@ def handle_register(payload: dict, users: dict) -> dict:
     username = payload.get("username", "")
     password = payload.get("password", "")
     if not username or not password:
-        return {"status": "error", "message": "Username and password required"}
+        return {
+            "status": "error",
+            "error_code": "MISSING_CREDENTIALS",
+            "message": "Username and password required",
+        }
     if not is_safe_username(username):
-        return {"status": "error", "message": "Invalid username"}
+        return {"status": "error", "error_code": "INVALID_USERNAME", "message": "Invalid username"}
     if username in users["users"]:
-        return {"status": "error", "message": "User already exists"}
+        return {"status": "error", "error_code": "USER_ALREADY_EXISTS", "message": "User already exists"}
     salt = os.urandom(16)
     users["users"][username] = {
         "salt": salt.hex(),
@@ -199,11 +199,13 @@ def process_request(
     file_locks: FileLockRegistry,
 ) -> dict:
     """Route one decoded request and return the response payload."""
+    started_at = time.perf_counter()
     request_id = payload.get("request_id") if isinstance(payload, dict) else None
     validation_error = validate_request(payload)
     if validation_error is not None:
         log_event(
             logging.WARNING,
+            "server",
             "request",
             "validate",
             "failure",
@@ -211,6 +213,7 @@ def process_request(
             request_id=request_id,
             error_code=validation_error.get("error_code"),
             reason=validation_error["message"],
+            duration_ms=elapsed_ms(started_at),
         )
         return validation_error
 
@@ -220,6 +223,7 @@ def process_request(
         response = state.register(payload)
         log_event(
             logging.INFO,
+            "server",
             "request",
             "register",
             "success" if response.get("status") == "ok" else "failure",
@@ -228,12 +232,14 @@ def process_request(
             username=payload.get("username", ""),
             reason=response.get("message", ""),
             error_code=response.get("error_code"),
+            duration_ms=elapsed_ms(started_at),
         )
         return finalize_response(response, request_id)
     if action == "login":
         response = state.login(payload, addr)
         log_event(
             logging.INFO,
+            "server",
             "request",
             "login",
             "success" if response.get("status") == "ok" else "failure",
@@ -242,12 +248,14 @@ def process_request(
             username=payload.get("username", ""),
             reason=response.get("message", ""),
             error_code=response.get("error_code"),
+            duration_ms=elapsed_ms(started_at),
         )
         return finalize_response(response, request_id)
     if action == "logout":
         response = state.logout(payload)
         log_event(
             logging.INFO,
+            "server",
             "request",
             "logout",
             "success" if response.get("status") == "ok" else "failure",
@@ -255,12 +263,14 @@ def process_request(
             request_id=request_id,
             reason=response.get("message", ""),
             error_code=response.get("error_code"),
+            duration_ms=elapsed_ms(started_at),
         )
         return finalize_response(response, request_id)
     username = state.get_username_from_token(payload)
     if not username:
         log_event(
             logging.INFO,
+            "server",
             "request",
             action,
             "failure",
@@ -268,12 +278,14 @@ def process_request(
             request_id=request_id,
             reason="not_authenticated",
             error_code="AUTH_REQUIRED",
+            duration_ms=elapsed_ms(started_at),
         )
         return error_response("AUTH_REQUIRED", "Not authenticated", request_id)
     if action == "list":
         response = handle_list(username)
         log_event(
             logging.INFO,
+            "server",
             "request",
             "list",
             "success",
@@ -281,12 +293,40 @@ def process_request(
             request_id=request_id,
             username=username,
             file_count=len(response.get("files", [])),
+            duration_ms=elapsed_ms(started_at),
         )
         return finalize_response(response, request_id)
     if action == "upload":
         response = handle_upload(payload, username, conn, file_locks, addr[0], request_id=request_id)
+        log_event(
+            logging.INFO if response.get("status") == "ok" else logging.WARNING,
+            "server",
+            "request",
+            "upload",
+            "success" if response.get("status") == "ok" else "failure",
+            addr[0],
+            request_id=request_id,
+            username=username,
+            bytes=payload.get("size"),
+            reason=response.get("message", ""),
+            error_code=response.get("error_code"),
+            duration_ms=elapsed_ms(started_at),
+        )
         return finalize_response(response, request_id)
     response = handle_download(payload, username, conn, file_locks, addr[0], request_id=request_id)
+    log_event(
+        logging.INFO if response.get("status", "ok") == "ok" else logging.WARNING,
+        "server",
+        "request",
+        "download",
+        "success" if response.get("status", "ok") == "ok" else "failure",
+        addr[0],
+        request_id=request_id,
+        username=username,
+        reason=response.get("message", ""),
+        error_code=response.get("error_code"),
+        duration_ms=elapsed_ms(started_at),
+    )
     return finalize_response(response, request_id)
 
 
@@ -300,6 +340,7 @@ def handle_client(
     with conn:
         log_event(
             logging.INFO,
+            "server",
             "connection",
             "open",
             "success",
@@ -312,6 +353,7 @@ def handle_client(
             except socket.timeout:
                 log_event(
                     logging.INFO,
+                    "server",
                     "connection",
                     "close",
                     "failure",
@@ -323,6 +365,7 @@ def handle_client(
             except json.JSONDecodeError:
                 log_event(
                     logging.WARNING,
+                    "server",
                     "request",
                     "decode_json",
                     "failure",
@@ -335,6 +378,7 @@ def handle_client(
             except ssl.SSLError as exc:
                 log_event(
                     logging.WARNING,
+                    "server",
                     "connection",
                     "tls_session",
                     "failure",
@@ -347,6 +391,7 @@ def handle_client(
             except ConnectionError:
                 log_event(
                     logging.INFO,
+                    "server",
                     "connection",
                     "close",
                     "success",
@@ -384,6 +429,7 @@ def main():
         log_event(
             logging.INFO,
             "server",
+            "server",
             "start",
             "success",
             "-",
@@ -401,6 +447,7 @@ def main():
                 except ssl.SSLError as exc:
                     log_event(
                         logging.WARNING,
+                        "server",
                         "connection",
                         "tls_handshake",
                         "failure",

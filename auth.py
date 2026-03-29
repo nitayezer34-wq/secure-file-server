@@ -81,18 +81,22 @@ def handle_login(
     username = payload.get("username", "")
     password = payload.get("password", "")
     if not username or not password:
-        return {"status": "error", "message": "Username and password required"}
+        return {
+            "status": "error",
+            "error_code": "MISSING_CREDENTIALS",
+            "message": "Username and password required",
+        }
     lockout_msg = check_lockout(username, login_failures)
     if lockout_msg:
-        return {"status": "error", "message": lockout_msg}
+        return {"status": "error", "error_code": "ACCOUNT_LOCKED", "message": lockout_msg}
     user = users["users"].get(username)
     if not user:
         record_failed_login(username, login_failures)
-        return {"status": "error", "message": "Invalid credentials"}
+        return {"status": "error", "error_code": "INVALID_CREDENTIALS", "message": "Invalid credentials"}
     salt = bytes.fromhex(user["salt"])
     if not hmac.compare_digest(hash_password(password, salt), user["password_hash"]):
         record_failed_login(username, login_failures)
-        return {"status": "error", "message": "Invalid credentials"}
+        return {"status": "error", "error_code": "INVALID_CREDENTIALS", "message": "Invalid credentials"}
     token = uuid.uuid4().hex
     sessions[token] = {
         "username": username,
@@ -108,4 +112,4 @@ def handle_logout(payload: dict, sessions: dict) -> dict:
     if token and token in sessions:
         sessions.pop(token, None)
         return {"status": "ok", "message": "Logged out"}
-    return {"status": "error", "message": "Invalid token"}
+    return {"status": "error", "error_code": "INVALID_TOKEN", "message": "Invalid token"}

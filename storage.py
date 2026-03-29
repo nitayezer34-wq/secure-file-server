@@ -6,9 +6,11 @@ import os
 import re
 import socket
 import threading
+import time
 from typing import Optional
 
 from config import get_env
+from logging_utils import log_event
 from protocol import build_response, recv_raw_file, send_json, send_raw_file
 
 STORAGE_DIR = get_env("STORAGE_DIR", "storage", str)
@@ -18,28 +20,9 @@ MAX_USERNAME_LEN = get_env("MAX_USERNAME_LEN", 64, int)
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
-def log_storage_event(
-    level: int,
-    event: str,
-    action: str,
-    status: str,
-    client_ip: str,
-    request_id: Optional[str] = None,
-    **fields,
-) -> None:
-    """Log storage-related events using the shared structured format."""
-    parts = [
-        f"event={event}",
-        f"action={action}",
-        f"status={status}",
-        f"client_ip={client_ip}",
-        f"request_id={request_id or '-'}",
-    ]
-    for key, value in fields.items():
-        if value is None or value == "":
-            continue
-        parts.append(f"{key}={value}")
-    logging.log(level, " ".join(parts))
+def elapsed_ms(start_time: float) -> int:
+    """Return elapsed milliseconds from a perf_counter start time."""
+    return int((time.perf_counter() - start_time) * 1000)
 
 
 class FileLockRegistry:
@@ -116,11 +99,13 @@ def handle_upload(
     request_id: Optional[str] = None,
 ) -> dict:
     """Receive and verify a file upload for the authenticated user."""
+    started_at = time.perf_counter()
     filename = payload.get("filename", "")
     size = payload.get("size")
     expected_hash = payload.get("sha256", "")
-    log_storage_event(
+    log_event(
         logging.INFO,
+        "storage",
         "upload",
         "upload",
         "start",
@@ -128,11 +113,12 @@ def handle_upload(
         request_id=request_id,
         username=username,
         filename=filename,
-        size=size,
+        bytes=size,
     )
     if not is_safe_filename(filename):
-        log_storage_event(
+        log_event(
             logging.WARNING,
+            "storage",
             "upload",
             "upload",
             "failure",
@@ -141,11 +127,14 @@ def handle_upload(
             username=username,
             filename=filename,
             reason="invalid_filename",
+            bytes=size,
+            duration_ms=elapsed_ms(started_at),
         )
-        return {"status": "error", "message": "Invalid filename"}
+        return {"status": "error", "error_code": "INVALID_FILENAME", "message": "Invalid filename"}
     if not isinstance(size, int) or size < 0:
-        log_storage_event(
+        log_event(
             logging.WARNING,
+            "storage",
             "upload",
             "upload",
             "failure",
@@ -154,11 +143,14 @@ def handle_upload(
             username=username,
             filename=filename,
             reason="invalid_size",
+            bytes=size,
+            duration_ms=elapsed_ms(started_at),
         )
-        return {"status": "error", "message": "Invalid size"}
+        return {"status": "error", "error_code": "INVALID_SIZE", "message": "Invalid size"}
     if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
-        log_storage_event(
+        log_event(
             logging.WARNING,
+            "storage",
             "upload",
             "upload",
             "failure",
@@ -167,11 +159,14 @@ def handle_upload(
             username=username,
             filename=filename,
             reason="invalid_sha256",
+            bytes=size,
+            duration_ms=elapsed_ms(started_at),
         )
-        return {"status": "error", "message": "Invalid sha256"}
+        return {"status": "error", "error_code": "INVALID_SHA256", "message": "Invalid sha256"}
     if size > MAX_FILE_SIZE:
-        log_storage_event(
+        log_event(
             logging.WARNING,
+            "storage",
             "upload",
             "upload",
             "failure",
@@ -180,9 +175,10 @@ def handle_upload(
             username=username,
             filename=filename,
             reason="file_too_large",
-            size=size,
+            bytes=size,
+            duration_ms=elapsed_ms(started_at),
         )
-        return {"status": "error", "message": "File too large"}
+        return {"status": "error", "error_code": "FILE_TOO_LARGE", "message": "File too large"}
     send_json(conn, build_response(request_id=request_id, message="READY"))
     user_dir = build_user_dir(username)
     os.makedirs(user_dir, exist_ok=True)
@@ -197,8 +193,9 @@ def handle_upload(
         except (ConnectionError, OSError, socket.timeout) as exc:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-            log_storage_event(
+            log_event(
                 logging.WARNING,
+                "storage",
                 "upload",
                 "upload",
                 "failure",
@@ -207,15 +204,18 @@ def handle_upload(
                 username=username,
                 filename=filename,
                 reason="transfer_interrupted",
+                bytes=size,
+                duration_ms=elapsed_ms(started_at),
                 error=exc,
             )
-            return {"status": "error", "message": "Upload interrupted"}
+            return {"status": "error", "error_code": "UPLOAD_INTERRUPTED", "message": "Upload interrupted"}
         received_hash = hasher.hexdigest()
         if received_hash != expected_hash:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-            log_storage_event(
+            log_event(
                 logging.WARNING,
+                "storage",
                 "upload",
                 "upload",
                 "failure",
@@ -224,13 +224,16 @@ def handle_upload(
                 username=username,
                 filename=filename,
                 reason="sha256_mismatch",
+                bytes=size,
+                duration_ms=elapsed_ms(started_at),
                 expected_sha256=expected_hash,
                 received_sha256=received_hash,
             )
-            return {"status": "error", "message": "sha256 mismatch"}
+            return {"status": "error", "error_code": "SHA256_MISMATCH", "message": "sha256 mismatch"}
         os.replace(temp_path, path)
-    log_storage_event(
+    log_event(
         logging.INFO,
+        "storage",
         "upload",
         "upload",
         "success",
@@ -238,7 +241,8 @@ def handle_upload(
         request_id=request_id,
         username=username,
         filename=filename,
-        size=size,
+        bytes=size,
+        duration_ms=elapsed_ms(started_at),
     )
     return {"status": "ok", "message": "Upload complete"}
 
@@ -252,9 +256,11 @@ def handle_download(
     request_id: Optional[str] = None,
 ) -> dict:
     """Send a file to the authenticated user together with integrity metadata."""
+    started_at = time.perf_counter()
     filename = payload.get("filename", "")
-    log_storage_event(
+    log_event(
         logging.INFO,
+        "storage",
         "download",
         "download",
         "start",
@@ -264,8 +270,9 @@ def handle_download(
         filename=filename,
     )
     if not is_safe_filename(filename):
-        log_storage_event(
+        log_event(
             logging.WARNING,
+            "storage",
             "download",
             "download",
             "failure",
@@ -274,12 +281,14 @@ def handle_download(
             username=username,
             filename=filename,
             reason="invalid_filename",
+            duration_ms=elapsed_ms(started_at),
         )
-        return {"status": "error", "message": "Invalid filename"}
+        return {"status": "error", "error_code": "INVALID_FILENAME", "message": "Invalid filename"}
     path = build_user_file_path(username, filename)
     if not os.path.isfile(path):
-        log_storage_event(
+        log_event(
             logging.INFO,
+            "storage",
             "download",
             "download",
             "failure",
@@ -288,8 +297,9 @@ def handle_download(
             username=username,
             filename=filename,
             reason="file_not_found",
+            duration_ms=elapsed_ms(started_at),
         )
-        return {"status": "error", "message": "File not found"}
+        return {"status": "error", "error_code": "FILE_NOT_FOUND", "message": "File not found"}
     path_lock = file_locks.for_path(path)
     with path_lock:
         size = os.path.getsize(path)
@@ -301,8 +311,9 @@ def handle_download(
         send_json(conn, build_response(request_id=request_id, size=size, sha256=sha256))
         with open(path, "rb") as handle:
             send_raw_file(conn, handle, size)
-    log_storage_event(
+    log_event(
         logging.INFO,
+        "storage",
         "download",
         "download",
         "success",
@@ -310,6 +321,7 @@ def handle_download(
         request_id=request_id,
         username=username,
         filename=filename,
-        size=size,
+        bytes=size,
+        duration_ms=elapsed_ms(started_at),
     )
     return {}
