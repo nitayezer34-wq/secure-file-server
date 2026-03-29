@@ -6,34 +6,6 @@ Custom application-layer protocol over raw TCP using length-prefixed JSON framin
 Thread-per-client server with authenticated multi-user access and per-user storage isolation.  
 Optional TLS with fail-fast validation, `.env`-driven configuration, and Docker/Compose deployment.
 
-## Quick Start
-
-### Local run
-```bash
-python3 setup.py init
-python3 server.py
-python3 client.py
-```
-
-### Docker Compose
-```bash
-python3 setup.py init
-docker compose up --build
-```
-
-### Enable TLS for local testing
-```bash
-python3 setup.py createcrt --name server --days 365
-```
-
-Then update `.env`:
-
-```env
-TLS_ENABLED=true
-SERVER_CERT_PATH=certs/server.crt
-SERVER_KEY_PATH=certs/server.key
-CA_CERT_PATH=certs/server.crt
-```
 
 ## Technical Highlights
 
@@ -65,6 +37,35 @@ CA_CERT_PATH=certs/server.crt
 - `docker compose` support
 - Persistent runtime volumes
 - Non-root container execution
+- 
+## Quick Start
+
+### Local run
+```bash
+python3 setup.py init
+python3 server.py
+python3 client.py
+```
+
+### Docker Compose
+```bash
+python3 setup.py init
+docker compose up --build
+```
+
+### Enable TLS for local testing
+```bash
+python3 setup.py createcrt --name server --days 365
+```
+
+Then update `.env`:
+
+```env
+TLS_ENABLED=true
+SERVER_CERT_PATH=certs/server.crt
+SERVER_KEY_PATH=certs/server.key
+CA_CERT_PATH=certs/server.crt
+```
 
 ## Project Structure
 ```text
