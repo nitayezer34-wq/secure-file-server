@@ -9,7 +9,7 @@ import string
 import sys
 
 from config import TLS_ENABLED, get_env, load_dotenv, validate_client_tls_config
-from protocol import recv_json, recv_raw_file, send_json, send_raw_file
+from protocol import build_request, recv_json, recv_raw_file, send_json, send_raw_file
 
 load_dotenv()
 
@@ -86,21 +86,21 @@ def main():
                     # Registration and login share the same prompt and request shape.
                     username = input("Username: ").strip()
                     password = getpass.getpass("Password: ")
-                    send_json(sock, {"action": action, "username": username, "password": password})
+                    send_json(sock, build_request(action, username=username, password=password))
                     reply = recv_json(sock)
                     print(reply.get("message", reply))
                     if action == "login" and reply.get("status") == "ok":
                         token = reply.get("token")
                     continue
                 if action == "logout":
-                    send_json(sock, {"action": "logout", "token": token})
+                    send_json(sock, build_request("logout", token=token))
                     reply = recv_json(sock)
                     print(reply.get("message", reply))
                     if reply.get("status") == "ok":
                         token = None
                     continue
                 if action == "list":
-                    send_json(sock, {"action": "list", "token": token})
+                    send_json(sock, build_request("list", token=token))
                     reply = recv_json(sock)
                     if reply.get("status") == "ok":
                         print("Files:", reply.get("files", []))
@@ -122,16 +122,7 @@ def main():
                     filename = os.path.basename(path)
                     sha256 = compute_sha256(path)
                     # The server validates size and hash before committing the file.
-                    send_json(
-                        sock,
-                        {
-                            "action": "upload",
-                            "token": token,
-                            "filename": filename,
-                            "size": size,
-                            "sha256": sha256,
-                        },
-                    )
+                    send_json(sock, build_request("upload", token=token, filename=filename, size=size, sha256=sha256))
                     ready = recv_json(sock)
                     if ready.get("status") != "ok":
                         print(ready.get("message", ready))
@@ -149,7 +140,7 @@ def main():
                     save_path = input("Save as (leave empty for same name): ").strip()
                     if not save_path:
                         save_path = filename
-                    send_json(sock, {"action": "download", "token": token, "filename": filename})
+                    send_json(sock, build_request("download", token=token, filename=filename))
                     reply = recv_json(sock)
                     if reply.get("status") != "ok":
                         print(reply.get("message", reply))

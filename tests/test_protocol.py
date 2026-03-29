@@ -51,6 +51,26 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(protocol.recv_json(sock), first)
         self.assertEqual(protocol.recv_json(sock), second)
 
+    def test_build_request_adds_protocol_metadata(self):
+        request = protocol.build_request("list", token="abc")
+        self.assertEqual(request["protocol_version"], protocol.PROTOCOL_VERSION)
+        self.assertEqual(request["action"], "list")
+        self.assertEqual(request["token"], "abc")
+        self.assertIn("request_id", request)
+
+    def test_error_response_is_consistent(self):
+        response = protocol.error_response("INVALID_REQUEST", "Bad request", request_id="req-1")
+        self.assertEqual(
+            response,
+            {
+                "protocol_version": protocol.PROTOCOL_VERSION,
+                "status": "error",
+                "request_id": "req-1",
+                "error_code": "INVALID_REQUEST",
+                "message": "Bad request",
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

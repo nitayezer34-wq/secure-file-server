@@ -2,6 +2,11 @@
 
 import json
 import struct
+import uuid
+from typing import Optional
+
+
+PROTOCOL_VERSION = 1
 
 
 def send_msg(sock, data: bytes):
@@ -45,6 +50,39 @@ def recv_json(sock) -> dict:
     return json.loads(data.decode("utf-8"))
 
 
+def build_request(action: str, **fields) -> dict:
+    """Build a protocol request with the required metadata envelope."""
+    payload = {
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": uuid.uuid4().hex,
+        "action": action,
+    }
+    payload.update(fields)
+    return payload
+
+
+def build_response(status: str = "ok", request_id: Optional[str] = None, **fields) -> dict:
+    """Build a protocol response with consistent metadata fields."""
+    payload = {
+        "protocol_version": PROTOCOL_VERSION,
+        "status": status,
+    }
+    if request_id is not None:
+        payload["request_id"] = request_id
+    payload.update(fields)
+    return payload
+
+
+def error_response(error_code: str, message: str, request_id: Optional[str] = None) -> dict:
+    """Build a consistent error payload."""
+    return build_response(
+        status="error",
+        request_id=request_id,
+        error_code=error_code,
+        message=message,
+    )
+
+
 def send_raw_file(sock, fileobj, size: int, chunk_size: int = 65536) -> None:
     """Stream raw file bytes after metadata has already been exchanged."""
     remaining = size
@@ -54,8 +92,6 @@ def send_raw_file(sock, fileobj, size: int, chunk_size: int = 65536) -> None:
             break
         sock.sendall(chunk)
         remaining -= len(chunk)
-
-
 
 def recv_raw_file(sock, fileobj, size: int, chunk_size: int = 65536, hasher=None) -> None:
     """Receive raw file bytes and optionally update a hash while writing them."""

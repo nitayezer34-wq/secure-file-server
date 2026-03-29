@@ -10,7 +10,7 @@ from typing import Optional
 
 from auth import get_username_from_token, handle_login, handle_logout, hash_password
 from config import TLS_ENABLED, get_env, load_dotenv, validate_server_tls_config
-from protocol import recv_json, send_json
+from protocol import PROTOCOL_VERSION, build_response, error_response, recv_json, send_json
 from storage import (
     FileLockRegistry,
     build_user_dir,
@@ -29,14 +29,91 @@ MAX_FILE_SIZE = get_env("MAX_FILE_SIZE", 10 * 1024 * 1024, int)
 SERVER_HOST = get_env("SERVER_HOST", "127.0.0.1", str)
 SERVER_PORT = get_env("SERVER_PORT", 9000, int)
 SOCKET_TIMEOUT_SECONDS = get_env("SOCKET_TIMEOUT_SECONDS", 30, int)
+REQUEST_SCHEMA = {
+    "register": {"username": str, "password": str},
+    "login": {"username": str, "password": str},
+    "logout": {"token": str},
+    "list": {"token": str},
+    "upload": {"token": str, "filename": str, "size": int, "sha256": str},
+    "download": {"token": str, "filename": str},
+}
 
 
-def log_request_event(level: int, action: str, status: str, client_ip: str, reason: Optional[str] = None) -> None:
-    """Log one structured request or connection event."""
-    message = f"event=request action={action} status={status} client_ip={client_ip}"
-    if reason:
-        message += f" reason={reason}"
-    logging.log(level, message)
+def log_event(
+    level: int,
+    event: str,
+    action: str,
+    status: str,
+    client_ip: str,
+    request_id: Optional[str] = None,
+    **fields,
+) -> None:
+    """Log one structured event with consistent key=value fields."""
+    parts = [
+        f"event={event}",
+        f"action={action}",
+        f"status={status}",
+        f"client_ip={client_ip}",
+        f"request_id={request_id or '-'}",
+    ]
+    for key, value in fields.items():
+        if value is None or value == "":
+            continue
+        parts.append(f"{key}={value}")
+    logging.log(level, " ".join(parts))
+
+
+def finalize_response(response: dict, request_id: Optional[str]) -> dict:
+    """Attach protocol metadata to application responses."""
+    if not response:
+        return {}
+    payload = dict(response)
+    payload.setdefault("protocol_version", PROTOCOL_VERSION)
+    if request_id is not None:
+        payload.setdefault("request_id", request_id)
+    if payload.get("status") == "error":
+        payload.setdefault("error_code", "REQUEST_FAILED")
+    return payload
+
+
+def validate_request(payload: dict) -> Optional[dict]:
+    """Validate the protocol envelope and required fields."""
+    if not isinstance(payload, dict):
+        return error_response("INVALID_REQUEST", "Request body must be a JSON object.")
+    protocol_version = payload.get("protocol_version")
+    request_id = payload.get("request_id")
+    action = payload.get("action")
+
+    if protocol_version != PROTOCOL_VERSION:
+        return error_response(
+            "UNSUPPORTED_PROTOCOL_VERSION",
+            f"Unsupported protocol_version: {protocol_version}",
+            request_id=request_id if isinstance(request_id, str) else None,
+        )
+    if not isinstance(request_id, str) or not request_id.strip():
+        return error_response("INVALID_REQUEST", "request_id is required and must be a non-empty string.")
+    if not isinstance(action, str) or not action.strip():
+        return error_response("INVALID_REQUEST", "action is required and must be a non-empty string.", request_id)
+
+    schema = REQUEST_SCHEMA.get(action)
+    if schema is None:
+        return error_response("UNKNOWN_ACTION", f"Unknown action: {action}", request_id)
+
+    for field_name, expected_type in schema.items():
+        value = payload.get(field_name)
+        if not isinstance(value, expected_type):
+            return error_response(
+                "INVALID_REQUEST",
+                f"{field_name} must be of type {expected_type.__name__}.",
+                request_id,
+            )
+        if expected_type is str and not value.strip():
+            return error_response(
+                "INVALID_REQUEST",
+                f"{field_name} must be a non-empty string.",
+                request_id,
+            )
+    return None
 
 
 def load_users() -> dict:
@@ -47,7 +124,15 @@ def load_users() -> dict:
         with open(USERS_FILE, "r", encoding="utf-8") as handle:
             return json.load(handle)
     except json.JSONDecodeError as exc:
-        logging.error("event=startup action=load_users status=failure reason=invalid_json error=%s", exc)
+        log_event(
+            logging.ERROR,
+            "startup",
+            "load_users",
+            "failure",
+            "-",
+            reason="invalid_json",
+            error=exc,
+        )
         raise RuntimeError(f"Invalid JSON in {USERS_FILE}") from exc
 
 
@@ -114,64 +199,95 @@ def process_request(
     file_locks: FileLockRegistry,
 ) -> dict:
     """Route one decoded request and return the response payload."""
-    if not payload:
-        log_request_event(logging.WARNING, "unknown", "failure", addr[0], "empty_payload")
-        return {"status": "error", "message": "Empty payload"}
-    action = payload.get("action")
+    request_id = payload.get("request_id") if isinstance(payload, dict) else None
+    validation_error = validate_request(payload)
+    if validation_error is not None:
+        log_event(
+            logging.WARNING,
+            "request",
+            "validate",
+            "failure",
+            addr[0],
+            request_id=request_id,
+            error_code=validation_error.get("error_code"),
+            reason=validation_error["message"],
+        )
+        return validation_error
+
+    action = payload["action"]
+    request_id = payload["request_id"]
     if action == "register":
         response = state.register(payload)
-        logging.info(
-            "event=request action=register status=%s client_ip=%s username=%s reason=%s",
+        log_event(
+            logging.INFO,
+            "request",
+            "register",
             "success" if response.get("status") == "ok" else "failure",
             addr[0],
-            payload.get("username", ""),
-            response.get("message", ""),
+            request_id=request_id,
+            username=payload.get("username", ""),
+            reason=response.get("message", ""),
+            error_code=response.get("error_code"),
         )
-        return response
+        return finalize_response(response, request_id)
     if action == "login":
         response = state.login(payload, addr)
-        if response.get("status") == "ok":
-            logging.info(
-                "event=request action=login status=success client_ip=%s username=%s",
-                addr[0],
-                payload.get("username", ""),
-            )
-        else:
-            logging.info(
-                "event=request action=login status=failure client_ip=%s username=%s reason=%s",
-                addr[0],
-                payload.get("username", ""),
-                response.get("message", ""),
-            )
-        return response
-    if action == "logout":
-        response = state.logout(payload)
-        logging.info(
-            "event=request action=logout status=%s client_ip=%s reason=%s",
+        log_event(
+            logging.INFO,
+            "request",
+            "login",
             "success" if response.get("status") == "ok" else "failure",
             addr[0],
-            response.get("message", ""),
+            request_id=request_id,
+            username=payload.get("username", ""),
+            reason=response.get("message", ""),
+            error_code=response.get("error_code"),
         )
-        return response
-    if action in {"list", "upload", "download"}:
-        username = state.get_username_from_token(payload)
-        if not username:
-            log_request_event(logging.INFO, action, "failure", addr[0], "not_authenticated")
-            return {"status": "error", "message": "Not authenticated"}
-        if action == "list":
-            response = handle_list(username)
-            logging.info(
-                "event=request action=list status=success client_ip=%s username=%s file_count=%s",
-                addr[0],
-                username,
-                len(response.get("files", [])),
-            )
-            return response
-        if action == "upload":
-            return handle_upload(payload, username, conn, file_locks, addr[0])
-        return handle_download(payload, username, conn, file_locks, addr[0])
-    log_request_event(logging.WARNING, str(action), "failure", addr[0], "unknown_action")
-    return {"status": "error", "message": "Unknown action"}
+        return finalize_response(response, request_id)
+    if action == "logout":
+        response = state.logout(payload)
+        log_event(
+            logging.INFO,
+            "request",
+            "logout",
+            "success" if response.get("status") == "ok" else "failure",
+            addr[0],
+            request_id=request_id,
+            reason=response.get("message", ""),
+            error_code=response.get("error_code"),
+        )
+        return finalize_response(response, request_id)
+    username = state.get_username_from_token(payload)
+    if not username:
+        log_event(
+            logging.INFO,
+            "request",
+            action,
+            "failure",
+            addr[0],
+            request_id=request_id,
+            reason="not_authenticated",
+            error_code="AUTH_REQUIRED",
+        )
+        return error_response("AUTH_REQUIRED", "Not authenticated", request_id)
+    if action == "list":
+        response = handle_list(username)
+        log_event(
+            logging.INFO,
+            "request",
+            "list",
+            "success",
+            addr[0],
+            request_id=request_id,
+            username=username,
+            file_count=len(response.get("files", [])),
+        )
+        return finalize_response(response, request_id)
+    if action == "upload":
+        response = handle_upload(payload, username, conn, file_locks, addr[0], request_id=request_id)
+        return finalize_response(response, request_id)
+    response = handle_download(payload, username, conn, file_locks, addr[0], request_id=request_id)
+    return finalize_response(response, request_id)
 
 
 def handle_client(
@@ -182,29 +298,61 @@ def handle_client(
 ) -> None:
     """Serve one connected client until it disconnects or sends invalid data."""
     with conn:
-        logging.info("event=connection action=connect status=success client_ip=%s client_port=%s", addr[0], addr[1])
+        log_event(
+            logging.INFO,
+            "connection",
+            "open",
+            "success",
+            addr[0],
+            client_port=addr[1],
+        )
         while True:
             try:
                 payload = recv_json(conn)
             except socket.timeout:
-                logging.info(
-                    "event=connection action=disconnect status=success client_ip=%s client_port=%s reason=socket_timeout",
+                log_event(
+                    logging.INFO,
+                    "connection",
+                    "close",
+                    "failure",
                     addr[0],
-                    addr[1],
+                    reason="socket_timeout",
+                    client_port=addr[1],
                 )
                 break
             except json.JSONDecodeError:
-                logging.warning(
-                    "event=request action=decode_json status=failure client_ip=%s client_port=%s reason=invalid_json",
+                log_event(
+                    logging.WARNING,
+                    "request",
+                    "decode_json",
+                    "failure",
                     addr[0],
-                    addr[1],
+                    reason="invalid_json",
+                    client_port=addr[1],
+                )
+                send_json(conn, error_response("INVALID_JSON", "Request body is not valid JSON."))
+                break
+            except ssl.SSLError as exc:
+                log_event(
+                    logging.WARNING,
+                    "connection",
+                    "tls_session",
+                    "failure",
+                    addr[0],
+                    reason="ssl_error",
+                    error=exc,
+                    client_port=addr[1],
                 )
                 break
             except ConnectionError:
-                logging.info(
-                    "event=connection action=disconnect status=success client_ip=%s client_port=%s reason=client_closed",
+                log_event(
+                    logging.INFO,
+                    "connection",
+                    "close",
+                    "success",
                     addr[0],
-                    addr[1],
+                    reason="client_closed",
+                    client_port=addr[1],
                 )
                 break
             response = process_request(payload, addr, state, conn, file_locks)
@@ -233,12 +381,16 @@ def main():
         server_sock.bind((SERVER_HOST, SERVER_PORT))
         server_sock.listen()
         mode = "TLS" if TLS_ENABLED else "plain TCP"
-        logging.info(
-            "event=server action=start status=success host=%s port=%s mode=%s timeout_seconds=%s",
-            SERVER_HOST,
-            SERVER_PORT,
-            mode,
-            SOCKET_TIMEOUT_SECONDS,
+        log_event(
+            logging.INFO,
+            "server",
+            "start",
+            "success",
+            "-",
+            host=SERVER_HOST,
+            port=SERVER_PORT,
+            mode=mode,
+            timeout_seconds=SOCKET_TIMEOUT_SECONDS,
         )
 
         while True:
@@ -247,11 +399,15 @@ def main():
                 try:
                     conn = ssl_context.wrap_socket(conn, server_side=True)
                 except ssl.SSLError as exc:
-                    logging.warning(
-                        "event=connection action=tls_handshake status=failure client_ip=%s client_port=%s reason=ssl_error error=%s",
+                    log_event(
+                        logging.WARNING,
+                        "connection",
+                        "tls_handshake",
+                        "failure",
                         addr[0],
-                        addr[1],
-                        exc,
+                        reason="ssl_error",
+                        error=exc,
+                        client_port=addr[1],
                     )
                     conn.close()
                     continue

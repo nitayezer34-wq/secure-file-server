@@ -6,6 +6,8 @@ import unittest
 from unittest.mock import patch
 
 import auth
+import config
+import protocol
 import server
 import storage
 
@@ -27,6 +29,9 @@ class FakeSocket:
 
 
 class ServerLogicTests(unittest.TestCase):
+    def make_request(self, action, **fields):
+        return protocol.build_request(action, **fields)
+
     def test_is_safe_filename_accepts_simple_names(self):
         self.assertTrue(storage.is_safe_filename("notes.txt"))
         self.assertTrue(storage.is_safe_filename("file-01.log"))
@@ -83,6 +88,57 @@ class ServerLogicTests(unittest.TestCase):
                 "Too many failed attempts. Try again later.",
             )
 
+    def test_handle_login_success_returns_token(self):
+        salt = bytes.fromhex("00112233445566778899aabbccddeeff")
+        users = {
+            "users": {
+                "alice": {
+                    "salt": salt.hex(),
+                    "password_hash": auth.hash_password("secret", salt),
+                }
+            }
+        }
+        sessions = {}
+        login_failures = {}
+        response = auth.handle_login(
+            {"username": "alice", "password": "secret"},
+            users,
+            sessions,
+            login_failures,
+            ("127.0.0.1", 12345),
+        )
+        self.assertEqual(response["status"], "ok")
+        self.assertIn("token", response)
+        self.assertEqual(sessions[response["token"]]["username"], "alice")
+
+    def test_handle_login_returns_lockout_message_for_locked_user(self):
+        salt = bytes.fromhex("00112233445566778899aabbccddeeff")
+        users = {
+            "users": {
+                "alice": {
+                    "salt": salt.hex(),
+                    "password_hash": auth.hash_password("secret", salt),
+                }
+            }
+        }
+        sessions = {}
+        login_failures = {
+            "alice": {
+                "count": 5,
+                "first_fail": time.time(),
+                "locked_until": time.time() + 60,
+            }
+        }
+        response = auth.handle_login(
+            {"username": "alice", "password": "secret"},
+            users,
+            sessions,
+            login_failures,
+            ("127.0.0.1", 12345),
+        )
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["message"], "Too many failed attempts. Try again later.")
+
     def test_check_lockout_clears_expired_entry(self):
         login_failures = {
             "alice": {
@@ -135,10 +191,58 @@ class ServerLogicTests(unittest.TestCase):
         addr = ("127.0.0.1", 9000)
 
         for action in ("list", "upload", "download"):
-            payload = {"action": action, "token": "invalid"}
+            payload = self.make_request(action, token="invalid", filename="demo.txt", size=10, sha256="a" * 64)
+            if action == "list":
+                payload = self.make_request(action, token="invalid")
+            if action == "download":
+                payload = self.make_request(action, token="invalid", filename="demo.txt")
             response = server.process_request(payload, addr, state, conn, file_locks)
             self.assertEqual(response["status"], "error")
+            self.assertEqual(response["error_code"], "AUTH_REQUIRED")
             self.assertEqual(response["message"], "Not authenticated")
+
+    def test_process_request_rejects_missing_request_id(self):
+        state = server.ServerState()
+        state.users = {"users": {}}
+        file_locks = storage.FileLockRegistry()
+        conn = FakeSocket()
+        addr = ("127.0.0.1", 9000)
+        payload = {"protocol_version": protocol.PROTOCOL_VERSION, "action": "list", "token": "abc"}
+        response = server.process_request(payload, addr, state, conn, file_locks)
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["error_code"], "INVALID_REQUEST")
+
+    def test_process_request_rejects_unsupported_protocol_version(self):
+        state = server.ServerState()
+        state.users = {"users": {}}
+        file_locks = storage.FileLockRegistry()
+        conn = FakeSocket()
+        addr = ("127.0.0.1", 9000)
+        payload = {"protocol_version": 999, "request_id": "req-1", "action": "list", "token": "abc"}
+        response = server.process_request(payload, addr, state, conn, file_locks)
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["error_code"], "UNSUPPORTED_PROTOCOL_VERSION")
+
+    def test_download_missing_file_returns_error(self):
+        sock = FakeSocket()
+        file_locks = storage.FileLockRegistry()
+        payload = {"filename": "missing.txt"}
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(storage, "STORAGE_DIR", temp_dir):
+            response = storage.handle_download(payload, "alice", sock, file_locks, request_id="req-1")
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["message"], "File not found")
+
+    def test_validate_server_tls_config_rejects_missing_files(self):
+        with patch.object(config, "SERVER_CERT_PATH", "certs/missing.crt"), patch.object(
+            config, "SERVER_KEY_PATH", "certs/missing.key"
+        ):
+            with self.assertRaises(RuntimeError):
+                config.validate_server_tls_config()
+
+    def test_validate_client_tls_config_rejects_missing_file(self):
+        with patch.object(config, "CA_CERT_PATH", "certs/missing.crt"):
+            with self.assertRaises(RuntimeError):
+                config.validate_client_tls_config()
 
 
 if __name__ == "__main__":
