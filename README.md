@@ -37,7 +37,10 @@ Optional TLS with fail-fast validation, `.env`-driven configuration, and Docker/
 - `docker compose` support
 - Persistent runtime volumes
 - Non-root container execution
-- 
+
+### Testing
+- Unit tests for protocol handling, authentication flows, and core server logic
+
 ## Quick Start
 
 ### Local run
@@ -206,6 +209,8 @@ When `TLS_ENABLED=true`:
 - misconfiguration fails early with a readable error instead of a vague SSL failure later
 
 For local development, `setup.py createcrt` generates a self-signed certificate suitable for `localhost` and `127.0.0.1`.
+
+Security-sensitive paths such as authentication, invalid requests, hash mismatches, and TLS misconfiguration are covered by unit tests.
 
 ## Configuration
 Configuration is environment-driven through `.env` and standard environment variables.
